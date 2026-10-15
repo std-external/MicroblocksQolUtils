@@ -526,6 +526,7 @@ public static class AutoRecorder {
         // The selected mode is run-wide; rhythm exceptions are attached to individual clips.
         reconstructBgm = MicroblocksQolUtilsModule.Settings.BgmMode == BgmRecordingMode.SfxOnlyWithPostMix;
         recordingRoomName = null;
+        recordingRoomBgmFollowsVideo = MicroblocksQolUtilsModule.Settings.RecordingBgmFollowsVideo;
     }
 
     private static void StartRunRecording(Level level) {
@@ -968,7 +969,8 @@ public static class AutoRecorder {
             DeathReplayPrefix.Add(deathClip);
 
         recordingRoomName = room;
-        recordingRoomBgmFollowsVideo = RhythmMapDetector.IsRhythmSensitive(level.Session.MapData, room);
+        recordingRoomBgmFollowsVideo = MicroblocksQolUtilsModule.Settings.RecordingBgmFollowsVideo
+            || RhythmMapDetector.IsRhythmSensitive(level.Session.MapData, room);
         if (branchActive) {
             branchStartSeconds = fullTime;
             branchMusicStart = MusicPosition.Read();
