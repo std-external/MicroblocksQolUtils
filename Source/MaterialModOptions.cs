@@ -849,8 +849,11 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
 
     private IEnumerator SaveSettingsDebounced() {
         settingsSaveRunning = true;
-        yield return Everest.SaveSettings();
-        settingsSaveRunning = false;
+        try {
+            yield return Everest.SaveSettings();
+        } finally {
+            settingsSaveRunning = false;
+        }
     }
 
     private IEnumerator SaveSettingsAfterPending() {
