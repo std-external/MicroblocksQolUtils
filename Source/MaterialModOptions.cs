@@ -295,11 +295,11 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
                 || MInput.Keyboard.Pressed(Keys.Space))
             && menu.Current is { } current
             && TryGetOption(current, out OptionSnapshot option)) {
-            if (option.Options.Count == 2) {
+            if (option.Kind == OptionKind.Switch) {
                 SetOptionIndex(current, option.Index == 0 ? 1 : 0);
                 return;
             }
-            if (CanUseDropdown(option)) {
+            if (option.Kind == OptionKind.Dropdown) {
                 OpenDropdown(current, option);
                 return;
             }
@@ -802,9 +802,9 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         }
         MaterialRect rect = placement.Value.Rect;
         if (TryGetOption(item, out OptionSnapshot option)) {
-            if (option.Options.Count == 2) {
+            if (option.Kind == OptionKind.Switch) {
                 SetOptionIndex(item, option.Index == 0 ? 1 : 0);
-            } else if (CanUseDropdown(option)) {
+            } else if (option.Kind == OptionKind.Dropdown) {
                 OpenDropdown(item, option);
             } else if (SliderControlArea(rect).Contains(mouse)) {
                 SetOptionFromMouse(item, option, SliderControlRect(rect), mouse.X);
@@ -1121,7 +1121,10 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
                 if (placement.Rect.Bottom < layout.Rows.Y || placement.Rect.Y > layout.Rows.Bottom) continue;
                 targets.Add(new MaterialInteractionTarget(ItemKey(placement.Item), placement.Rect,
                     Focused: menu.Current == placement.Item));
-                if (placement.Item is TextMenu.Slider) {
+                if (TryGetOption(placement.Item, out OptionSnapshot touchOption)
+                    && touchOption.Kind == OptionKind.Range) {
+                    // Only real ranges get a slider gesture; an enum is also a TextMenu.Slider
+                    // in Everest, but it is rendered as a dropdown.
                     targets.Add(new MaterialInteractionTarget(ItemKey(placement.Item) + ".touch-slider",
                         SliderControlRect(PrimaryRect(placement)), TouchKind: "slider"));
                 }
@@ -1284,16 +1287,16 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         bool enabled = !item.Disabled;
         Color labelColor = enabled ? palette.OnSurface : palette.OnSurfaceVariant * 0.5f;
         if (TryGetOption(item, out OptionSnapshot option)) {
-            MaterialRect control = option.Options.Count == 2
-                ? SwitchControlArea(rect)
-                : CanUseDropdown(option)
-                    ? DropdownControlRect(rect)
-                    : SliderControlArea(rect);
+            MaterialRect control = option.Kind switch {
+                OptionKind.Switch => SwitchControlArea(rect),
+                OptionKind.Dropdown => DropdownControlRect(rect),
+                _ => SliderControlArea(rect)
+            };
             RenderItemLabel(option.Label, rect, control.X - rect.X - 62f, labelColor, alpha,
                 hasDescription);
-            if (option.Options.Count == 2) {
+            if (option.Kind == OptionKind.Switch) {
                 RenderSwitch(option, rect, palette, alpha, enabled);
-            } else if (CanUseDropdown(option)) {
+            } else if (option.Kind == OptionKind.Dropdown) {
                 RenderOptionControl(item, option, rect, palette, alpha, enabled);
             } else {
                 RenderOptionSlider(option, rect, palette, alpha, enabled);
@@ -1675,8 +1678,10 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             labels.Add(label?.ToString() ?? "");
             entries.Add(entry);
         }
+        Delegate? change = changeField?.GetValue(item) as Delegate;
         snapshot = new OptionSnapshot(
             labelField.GetValue(item)?.ToString() ?? "",
+            ClassifyOption(item, labels, entries, change),
             Math.Clamp((int)(indexField.GetValue(item) ?? 0), 0, Math.Max(0, labels.Count - 1)),
             labels,
             entries,
@@ -1686,6 +1691,88 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         );
         return true;
     }
+
+    /// <summary>
+    /// TextMenu.Option only knows its value type via a generic argument, and Everest uses
+    /// Slider for both integer ranges and enums. Classify by the backing property when the
+    /// change delegate exposes one, and fall back to the value/label shape otherwise.
+    /// </summary>
+    private static OptionKind ClassifyOption(TextMenu.Item item, List<string> labels,
+        List<object> entries, Delegate? change) {
+        if (item is TextMenu.Option<bool>) return OptionKind.Switch;
+        bool isSlider = item is TextMenu.Slider;
+        bool isIntOption = item is TextMenu.Option<int>;
+        if (!isSlider && !isIntOption) return OptionKind.Dropdown;
+
+        bool? enumBacked = ChangeTargetsEnum(change);
+        if (enumBacked is true) return OptionKind.Dropdown;
+        bool consecutive = HasConsecutiveInts(entries);
+        bool numericLabels = labels.Count > 0 && labels.All(LooksNumeric);
+        if (isSlider) {
+            if (enumBacked is false) return OptionKind.Range;
+            return consecutive && numericLabels ? OptionKind.Range : OptionKind.Dropdown;
+        }
+        // A hand-built Option<int> is only a range when its values really are a sequence.
+        return consecutive && numericLabels ? OptionKind.Range : OptionKind.Dropdown;
+    }
+
+    private static bool? ChangeTargetsEnum(Delegate? change) {
+        object? target = change?.Target;
+        if (target is null) return null;
+        bool sawEnum = false;
+        bool sawNumeric = false;
+        foreach (FieldInfo field in target.GetType().GetFields(
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)) {
+            object? value;
+            try {
+                value = field.GetValue(target);
+            } catch {
+                continue;
+            }
+            if (value is PropertyInfo property) {
+                if (property.PropertyType.IsEnum) sawEnum = true;
+                else if (IsNumericType(property.PropertyType)) sawNumeric = true;
+            } else if (value is Array array && array.GetType().GetElementType()?.IsEnum == true) {
+                sawEnum = true;
+            } else if (field.FieldType.IsEnum) {
+                sawEnum = true;
+            }
+        }
+        // A compiler display class can capture several properties from the enclosing scope;
+        // only trust the answer when the captured property types are unambiguous.
+        if (sawEnum && !sawNumeric) return true;
+        if (sawNumeric && !sawEnum) return false;
+        return null;
+    }
+
+    private static bool IsNumericType(Type type) =>
+        type == typeof(int) || type == typeof(float) || type == typeof(double)
+        || type == typeof(long) || type == typeof(short) || type == typeof(byte);
+
+    private static bool HasConsecutiveInts(List<object> entries) {
+        int? previous = null;
+        foreach (object entry in entries) {
+            if (EntryValue(entry) is not int value) return false;
+            if (previous.HasValue && value != previous.Value + 1) return false;
+            previous = value;
+        }
+        return previous.HasValue;
+    }
+
+    private static bool LooksNumeric(string value) {
+        string text = value.Trim();
+        int index = text.StartsWith('-') || text.StartsWith('+') ? 1 : 0;
+        int digits = 0;
+        while (index < text.Length && char.IsDigit(text[index])) {
+            index++;
+            digits++;
+        }
+        return digits > 0;
+    }
+
+    private static object? EntryValue(object entry) =>
+        entry.GetType().GetProperty("Item2")?.GetValue(entry)
+        ?? entry.GetType().GetField("Item2")?.GetValue(entry);
 
     private static bool TryGetIntSlider(TextMenu.Item item, out IntSliderSnapshot snapshot) {
         if (item is not TextMenuExt.IntSlider slider) {
@@ -1764,7 +1851,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     }
 
     private static bool CanUseDropdown(OptionSnapshot option) =>
-        option.Options.Count >= 3;
+        option.Kind == OptionKind.Dropdown;
 
     private static void SetOptionIndex(TextMenu.Item item, int targetIndex) {
         if (!TryGetOption(item, out OptionSnapshot option) || option.Options.Count == 0) return;
@@ -2075,8 +2162,15 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
 
     private readonly record struct TabVisual(string Icon, Color Accent);
 
+    private enum OptionKind {
+        Switch,
+        Dropdown,
+        Range
+    }
+
     private sealed record OptionSnapshot(
         string Label,
+        OptionKind Kind,
         int Index,
         List<string> Options,
         List<object> Entries,
