@@ -84,6 +84,10 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private int savedItemOrdinal = -1;
     private TextMenu.Item? dropdownItem;
     private TextMenu.Item? compositePopupItem;
+    private TextMenu.Item? draggedSlider;
+    private bool draggedSliderChanged;
+    private int keyboardSliderDirection;
+    private float keyboardSliderHold;
     private int dropdownHighlight;
     private int dropdownFirstVisible;
     private string tabSearchText = "";
@@ -304,6 +308,8 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
                 return;
             }
         }
+
+        if (HandleRangeKeyboard()) return;
 
         UpdateMouse(layout);
         int previousSelection = menu.Selection;
@@ -754,9 +760,82 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private static bool IsWarningColor(Color color) =>
         color == Color.OrangeRed || color == Color.Goldenrod || color == Color.Red || color == Color.Yellow;
 
+    /// <summary>
+    /// Range settings use an adaptive keyboard step (about 50 presses for the whole range);
+    /// holding the direction accelerates after 0.4s (x2 / x4 / x8) and resets on release.
+    /// Mouse/touch dragging keeps its pixel-linear mapping.
+    /// </summary>
+    private bool HandleRangeKeyboard() {
+        if (menu?.Current is not { } item) {
+            ResetKeyboardSlider();
+            return false;
+        }
+        bool left = Input.MenuLeft.Check;
+        bool right = Input.MenuRight.Check;
+        int direction = left == right ? 0 : left ? -1 : 1;
+        if (direction == 0) {
+            ResetKeyboardSlider();
+            return false;
+        }
+
+        bool isRange = TryGetOption(item, out OptionSnapshot option)
+            && option.Kind == OptionKind.Range;
+        bool isIntSlider = !isRange && TryGetIntSlider(item, out _);
+        if (!isRange && !isIntSlider) {
+            ResetKeyboardSlider();
+            return false;
+        }
+
+        if (direction != keyboardSliderDirection) {
+            keyboardSliderDirection = direction;
+            keyboardSliderHold = 0f;
+        }
+        keyboardSliderHold += Engine.RawDeltaTime;
+        bool pressed = left ? Input.MenuLeft.Pressed : Input.MenuRight.Pressed;
+        if (!pressed) return true; // consume held input; do not let TextMenu move one step
+
+        int multiplier = keyboardSliderHold >= 1.2f ? 8
+            : keyboardSliderHold >= 0.8f ? 4
+            : keyboardSliderHold >= 0.4f ? 2
+            : 1;
+        if (isRange) {
+            int span = Math.Max(1, option.Options.Count - 1);
+            int step = Math.Max(1, (int)MathF.Round(span / 50f));
+            SetOptionIndex(item, option.Index + direction * step * multiplier);
+        } else if (TryGetIntSlider(item, out IntSliderSnapshot slider)) {
+            int span = Math.Max(1, slider.Maximum - slider.Minimum);
+            int step = Math.Max(1, (int)MathF.Round(span / 50f));
+            SetIntSliderValue(item, slider, slider.Value + direction * step * multiplier);
+        }
+        return true;
+    }
+
+    private void ResetKeyboardSlider() {
+        keyboardSliderDirection = 0;
+        keyboardSliderHold = 0f;
+    }
+
+    private static void SetIntSliderValue(TextMenu.Item item, IntSliderSnapshot slider, int value) {
+        if (item is not TextMenuExt.IntSlider intSlider) return;
+        value = Math.Clamp(value, slider.Minimum, slider.Maximum);
+        if (value == intSlider.Index) return;
+        int previous = intSlider.Index;
+        intSlider.PreviousIndex = previous;
+        intSlider.Index = value;
+        intSlider.OnValueChange?.Invoke(value);
+        intSlider.ValueWiggler?.Start();
+        Audio.Play(value > previous
+            ? "event:/ui/main/button_toggle_on"
+            : "event:/ui/main/button_toggle_off");
+    }
+
     private void UpdateMouse(ModOptionsLayout layout) {
         if (menu is null) return;
         Vector2 mouse = MaterialTouch.Position;
+        if (draggedSlider is not null) {
+            UpdateSliderDrag(layout, mouse);
+            return;
+        }
         bool scrolled = false;
         if (MaterialTouch.WheelDelta != 0) {
             float direction = -Math.Sign(MaterialTouch.WheelDelta);
@@ -807,17 +886,64 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             } else if (option.Kind == OptionKind.Dropdown) {
                 OpenDropdown(item, option);
             } else if (SliderControlArea(rect).Contains(mouse)) {
+                draggedSlider = item;
+                draggedSliderChanged = false;
+                int before = option.Index;
                 SetOptionFromMouse(item, option, SliderControlRect(rect), mouse.X);
+                if (TryGetOption(item, out OptionSnapshot changed) && changed.Index != before)
+                    draggedSliderChanged = true;
             }
         } else if (TryGetIntSlider(item, out IntSliderSnapshot slider)) {
-            if (SliderControlArea(rect).Contains(mouse))
+            if (SliderControlArea(rect).Contains(mouse)) {
+                draggedSlider = item;
+                draggedSliderChanged = false;
+                int before = slider.Value;
                 SetIntSliderFromMouse(item, slider, SliderControlRect(rect), mouse.X);
+                if (TryGetIntSlider(item, out IntSliderSnapshot changed) && changed.Value != before)
+                    draggedSliderChanged = true;
+            }
         } else if (IsCompositeMenu(item)) {
             OpenCompositePopup(item);
         } else {
             ActivateItem(item);
         }
         motion.Pulse(ItemKey(item), mouse);
+    }
+
+    private void UpdateSliderDrag(ModOptionsLayout layout, Vector2 mouse) {
+        if (!MaterialTouch.CheckLeftButton) {
+            draggedSlider = null;
+            if (draggedSliderChanged) {
+                draggedSliderChanged = false;
+                Add(new Coroutine(Everest.SaveSettings()));
+            }
+            return;
+        }
+        if (draggedSlider is not { } dragged) return;
+        if (!TryGetRowPlacement(layout, dragged, out RowPlacement placement)) return;
+        if (TryGetOption(dragged, out OptionSnapshot option)
+            && option.Kind == OptionKind.Range) {
+            int before = option.Index;
+            SetOptionFromMouse(dragged, option, SliderControlRect(placement.Rect), mouse.X);
+            if (TryGetOption(dragged, out OptionSnapshot changed) && changed.Index != before)
+                draggedSliderChanged = true;
+        } else if (TryGetIntSlider(dragged, out IntSliderSnapshot slider)) {
+            int before = slider.Value;
+            SetIntSliderFromMouse(dragged, slider, SliderControlRect(placement.Rect), mouse.X);
+            if (TryGetIntSlider(dragged, out IntSliderSnapshot changed) && changed.Value != before)
+                draggedSliderChanged = true;
+        }
+    }
+
+    private bool TryGetRowPlacement(ModOptionsLayout layout, TextMenu.Item item,
+        out RowPlacement placement) {
+        foreach (RowPlacement candidate in RowPlacements(layout)) {
+            if (candidate.Item != item) continue;
+            placement = candidate;
+            return true;
+        }
+        placement = default;
+        return false;
     }
 
     private static void ActivateItem(TextMenu.Item item) {
@@ -1392,26 +1518,41 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
 
     private static void RenderOptionSlider(OptionSnapshot option, MaterialRect rect,
         MaterialPalette palette, float alpha, bool enabled) {
+        MaterialRect control = OptionControlRect(rect);
+        RenderSliderBackground(control, palette, alpha);
         MaterialRect track = SliderControlRect(rect);
         float amount = option.Options.Count <= 1 ? 0f : option.Index / (float)(option.Options.Count - 1);
         RenderSliderTrack(track, amount, palette, alpha, enabled);
         string value = option.Options.Count == 0
             ? ""
             : option.Options[Math.Clamp(option.Index, 0, option.Options.Count - 1)];
-        MaterialUiKit.Text(MaterialTextUtil.Ellipsize(value, 390f, 0.27f, UiFontWeight.Bold),
-            new Vector2(track.Center.X, track.Y - 12f), new Vector2(0.5f, 1f),
-            MaterialTextRole.Label, palette.OnSurfaceVariant, alpha, scaleOverride: 0.27f);
+        MaterialUiKit.Text(MaterialTextUtil.Ellipsize(value, control.Width - 30f, 0.27f, UiFontWeight.Bold),
+            new Vector2(track.Center.X, track.Y - 5f), new Vector2(0.5f, 1f),
+            MaterialTextRole.Label, enabled ? palette.OnSurface : palette.OnSurfaceVariant * 0.5f,
+            alpha, scaleOverride: 0.27f);
+    }
+
+    private static void RenderSliderBackground(MaterialRect control, MaterialPalette palette,
+        float alpha) {
+        MaterialUi.RoundedRect(control.X, control.Y, control.Width, control.Height, 16f,
+            palette.Surface * (0.76f * alpha));
+        MaterialUi.RoundedOutline(control.X, control.Y, control.Width, control.Height, 16f, 1f,
+            palette.Outline * (0.52f * alpha));
     }
 
     private static void RenderIntSlider(IntSliderSnapshot slider, MaterialRect rect,
         MaterialPalette palette, float alpha, bool enabled) {
+        MaterialRect control = OptionControlRect(rect);
+        RenderSliderBackground(control, palette, alpha);
         MaterialRect track = SliderControlRect(rect);
         float amount = slider.Maximum == slider.Minimum
             ? 0f
             : (slider.Value - slider.Minimum) / (float)(slider.Maximum - slider.Minimum);
         RenderSliderTrack(track, amount, palette, alpha, enabled);
-        MaterialUiKit.Text(slider.Value.ToString(), new Vector2(track.Center.X, track.Y - 12f),
-            new Vector2(0.5f, 1f), MaterialTextRole.Label, palette.OnSurfaceVariant,
+        MaterialUiKit.Text(slider.Value.ToString(),
+            new Vector2(track.Center.X, track.Y - 5f),
+            new Vector2(0.5f, 1f), MaterialTextRole.Label,
+            enabled ? palette.OnSurface : palette.OnSurfaceVariant * 0.5f,
             alpha, scaleOverride: 0.27f);
     }
 
@@ -1929,26 +2070,21 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         32f
     );
 
-    private static MaterialRect DropdownControlRect(MaterialRect rect) => new(
+    private static MaterialRect OptionControlRect(MaterialRect rect) => new(
         rect.Right - 424f,
         rect.Center.Y - 24f,
         400f,
         48f
     );
 
-    private static MaterialRect SliderControlArea(MaterialRect rect) => new(
-        rect.Right - 504f,
-        rect.Y,
-        480f,
-        rect.Height
-    );
+    private static MaterialRect DropdownControlRect(MaterialRect rect) => OptionControlRect(rect);
 
-    private static MaterialRect SliderControlRect(MaterialRect rect) => new(
-        rect.Right - 474f,
-        rect.Center.Y + 9f,
-        430f,
-        8f
-    );
+    private static MaterialRect SliderControlArea(MaterialRect rect) => OptionControlRect(rect);
+
+    private static MaterialRect SliderControlRect(MaterialRect rect) {
+        MaterialRect control = OptionControlRect(rect);
+        return new MaterialRect(control.X + 10f, control.Center.Y + 8f, control.Width - 20f, 8f);
+    }
 
     private static MaterialRect ActionControlRect(MaterialRect rect) => new(
         rect.Right - 304f,
