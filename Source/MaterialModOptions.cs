@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using Celeste.Mod.UI;
@@ -30,6 +31,8 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private const int DropdownMaxVisibleItems = 8;
     private const int SearchTextLimit = 80;
     private const float CompositePopupHorizontalPadding = 48f;
+    // Rate-limit the tick audio when adjusting slider.
+    private const float SliderAudioInterval = 0.08f;
 
     private static readonly string[] TabIconPool = [
         "bolt", "layers", "map", "route", "sports_esports", "timer", "visibility",
@@ -51,6 +54,11 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private static Hook? gotoRoutineHook;
     private static bool hookFailed;
     private static readonly FieldInfo? textMenuWidthField = typeof(TextMenu).GetField("width",
+        BindingFlags.Instance | BindingFlags.NonPublic);
+    private static readonly ConditionalWeakTable<TextMenu.Item, OptionMetadata> optionMetadata = new();
+    private static readonly FieldInfo? intSliderMinimumField = typeof(TextMenuExt.IntSlider).GetField("min",
+        BindingFlags.Instance | BindingFlags.NonPublic);
+    private static readonly FieldInfo? intSliderMaximumField = typeof(TextMenuExt.IntSlider).GetField("max",
         BindingFlags.Instance | BindingFlags.NonPublic);
 
     private readonly List<ModTab> tabs = [];
@@ -88,9 +96,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private int keyboardSliderDirection;
     private float keyboardSliderHold;
     private float keyboardSliderAccumulator;
-    private float settingsSaveDelay = -1f;
-    private bool settingsSaveRunning;
-    private bool settingsDirty;
+    private float sliderAudioCooldown;
     private int dropdownHighlight;
     private int dropdownFirstVisible;
     private string tabSearchText = "";
@@ -168,7 +174,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         if (menu is not null) menu.Focused = false;
         SaveTabState();
         for (float timer = 0f; timer < 0.16f; timer += Engine.RawDeltaTime) yield return null;
-        yield return SaveSettingsAfterPending();
+        yield return Everest.SaveSettings();
         DetachMenu();
         Visible = false;
     }
@@ -206,10 +212,11 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         compositePopupScroll.Update(MaxCompositePopupScroll(layout));
         ease = Calc.Approach(ease, display ? 1f : 0f, Engine.RawDeltaTime * 7.5f);
         inputDelay -= Engine.RawDeltaTime;
-        UpdateSettingsSave();
+        sliderAudioCooldown = Math.Max(0f, sliderAudioCooldown - Engine.RawDeltaTime);
         UpdateInteractions(layout);
 
         if (!display) {
+            CancelSliderDrag();
             if (pauseLevel is not null && ease <= 0.001f && !saveStarted) {
                 saveStarted = true;
                 Add(new Coroutine(SaveAndFinishPause()));
@@ -217,15 +224,20 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             return;
         }
 
-        if (menu is null) return;
+        if (menu is null) {
+            CancelSliderDrag();
+            return;
+        }
         if (configOverlayOpen) {
             // The key/button config screen owns input while it is open.
+            CancelSliderDrag();
             menu.Focused = false;
             return;
         }
         bool acceptsInput = pauseLevel is not null || Selected && Focused;
         if (acceptsInput && inputDelay <= 0f && dropdownItem is null && compositePopupItem is null
             && UpdateSearchInput(layout)) {
+            CancelSliderDrag();
             menu.Focused = false;
             menu.Update();
             CaptureNaturalVisibility();
@@ -234,12 +246,14 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         }
         menu.Focused = searchTarget == SearchTarget.None;
         if (!menu.Focused) {
+            CancelSliderDrag();
             menu.Update();
             CaptureNaturalVisibility();
             ApplyTabVisibility(invokeSelectionCallbacks: false);
             return;
         }
         if (!acceptsInput || inputDelay > 0f) {
+            CancelSliderDrag();
             menu.Focused = false;
             menu.Update();
             menu.Focused = true;
@@ -249,10 +263,12 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         }
 
         if (dropdownItem is not null) {
+            CancelSliderDrag();
             UpdateDropdown(layout);
             return;
         }
         if (compositePopupItem is not null) {
+            CancelSliderDrag();
             menu.Focused = false;
             UpdateCompositePopup(layout);
             return;
@@ -313,11 +329,12 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             }
         }
 
-        if (HandleRangeKeyboard()) return;
-
+        bool rangeHandled = HandleRangeKeyboard();
         UpdateMouse(layout);
         int previousSelection = menu.Selection;
+        if (rangeHandled) menu.Focused = false;
         menu.Update();
+        if (rangeHandled) menu.Focused = true;
         if (menu.Current is { } expanded && IsCompositeMenu(expanded) && IsExpandedComposite(expanded)) {
             AdoptCompositePopup(expanded);
             return;
@@ -765,10 +782,9 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         color == Color.OrangeRed || color == Color.Goldenrod || color == Color.Red || color == Color.Yellow;
 
     /// <summary>
-    /// A single tap always moves one minimum step. Holding starts a smooth ramp after
-    /// 0.45s: the rate grows from 0 to about range/12 steps per second (8..160), so the
-    /// same key is fine for nudging and fast for long ranges. A/D work as well as the
-    /// arrow keys. Mouse/touch dragging keeps its pixel-linear mapping.
+    /// A single tap always moves one minimum step.
+    /// Holding starts a smooth ramp.
+    /// Mouse / touch dragging keeps its pixel-linear mapping.
     /// </summary>
     private bool HandleRangeKeyboard() {
         if (menu?.Current is not { } item) {
@@ -792,36 +808,52 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             return false;
         }
 
+        bool atLimit = isRange
+            ? direction < 0 ? option.Index <= 0 : option.Index >= option.Options.Count - 1
+            : direction < 0 ? slider.Value <= slider.Minimum : slider.Value >= slider.Maximum;
+        if (atLimit) {
+            ResetKeyboardSlider();
+            return false;
+        }
+
         if (direction != keyboardSliderDirection) {
             // The first tap is always exactly one minimum step; repeated events are ignored
             // below because the hold timer owns the acceleration.
             keyboardSliderDirection = direction;
             keyboardSliderHold = 0f;
             keyboardSliderAccumulator = 0f;
-            if (isRange) SetOptionIndex(item, option.Index + direction);
-            else SetIntSliderValue(item, slider, slider.Value + direction);
-            MarkSettingsDirty();
+            bool tapped = isRange
+                ? SetOptionIndex(item, option.Index + direction)
+                : SetIntSliderValue(item, slider, slider.Value + direction);
+            if (tapped) sliderAudioCooldown = SliderAudioInterval;
             return true;
         }
 
+        float previousHold = keyboardSliderHold;
         keyboardSliderHold += Engine.RawDeltaTime;
-        const float delay = 0.45f;
-        const float ramp = 1.0f;
+        const float delay = 0.2f;
         if (keyboardSliderHold <= delay) return true;
 
         int span = isRange ? Math.Max(1, option.Options.Count - 1)
             : Math.Max(1, slider.Maximum - slider.Minimum);
-        float maxRate = Math.Clamp(span / 12f, 8f, 160f);
+        float spanScale = Math.Clamp(MathF.Log10(span) / 4f, 0f, 1f);
+        float ramp = 0.45f + 1.4f * spanScale;
+        float maxRate = Math.Clamp(span / 2.5f, 15f, 800f);
+        float startFraction = Math.Clamp((1f - spanScale) * 0.35f, 0f, 0.35f);
         float progress = Math.Clamp((keyboardSliderHold - delay) / ramp, 0f, 1f);
-        progress = progress * progress * (3f - 2f * progress);
-        keyboardSliderAccumulator += maxRate * progress * Engine.RawDeltaTime;
+        progress *= progress;
+        float rate = maxRate * (startFraction + (1f - startFraction) * progress);
+        keyboardSliderAccumulator += rate * Engine.RawDeltaTime;
+        if (previousHold <= delay) keyboardSliderAccumulator += 1f;
         int steps = (int)keyboardSliderAccumulator;
         if (steps <= 0) return true;
         keyboardSliderAccumulator -= steps;
 
-        if (isRange) SetOptionIndex(item, option.Index + direction * steps);
-        else SetIntSliderValue(item, slider, slider.Value + direction * steps);
-        MarkSettingsDirty();
+        bool playSound = sliderAudioCooldown <= 0f;
+        bool changed = isRange
+            ? SetOptionIndex(item, option.Index + direction * steps, playSound)
+            : SetIntSliderValue(item, slider, slider.Value + direction * steps, playSound);
+        if (changed && playSound) sliderAudioCooldown = SliderAudioInterval;
         return true;
     }
 
@@ -831,49 +863,22 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         keyboardSliderAccumulator = 0f;
     }
 
-    private void MarkSettingsDirty() {
-        settingsDirty = true;
-        settingsSaveDelay = 0.5f;
-    }
-
-    private void UpdateSettingsSave() {
-        if (settingsSaveDelay < 0f || settingsSaveRunning || !display) return;
-        // Do not write while a slider is still being dragged or a direction key is held.
-        if (draggedSlider is not null || keyboardSliderDirection != 0) return;
-        settingsSaveDelay -= Engine.RawDeltaTime;
-        if (settingsSaveDelay > 0f || !settingsDirty) return;
-        settingsDirty = false;
-        settingsSaveDelay = -1f;
-        Add(new Coroutine(SaveSettingsDebounced()));
-    }
-
-    private IEnumerator SaveSettingsDebounced() {
-        settingsSaveRunning = true;
-        try {
-            yield return Everest.SaveSettings();
-        } finally {
-            settingsSaveRunning = false;
-        }
-    }
-
-    private IEnumerator SaveSettingsAfterPending() {
-        settingsSaveDelay = -1f;
-        while (settingsSaveRunning) yield return null;
-        yield return Everest.SaveSettings();
-    }
-
-    private static void SetIntSliderValue(TextMenu.Item item, IntSliderSnapshot slider, int value) {
-        if (item is not TextMenuExt.IntSlider intSlider) return;
+    private static bool SetIntSliderValue(TextMenu.Item item, IntSliderSnapshot slider, int value,
+        bool playSound = true) {
+        if (item is not TextMenuExt.IntSlider intSlider) return false;
         value = Math.Clamp(value, slider.Minimum, slider.Maximum);
-        if (value == intSlider.Index) return;
+        if (value == intSlider.Index) return false;
         int previous = intSlider.Index;
         intSlider.PreviousIndex = previous;
         intSlider.Index = value;
         intSlider.OnValueChange?.Invoke(value);
         intSlider.ValueWiggler?.Start();
-        Audio.Play(value > previous
-            ? "event:/ui/main/button_toggle_on"
-            : "event:/ui/main/button_toggle_off");
+        if (playSound) {
+            Audio.Play(value > previous
+                ? "event:/ui/main/button_toggle_on"
+                : "event:/ui/main/button_toggle_off");
+        }
+        return true;
     }
 
     private void UpdateMouse(ModOptionsLayout layout) {
@@ -932,20 +937,17 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
                 SetOptionIndex(item, option.Index == 0 ? 1 : 0);
             } else if (option.Kind == OptionKind.Dropdown) {
                 OpenDropdown(item, option);
-            } else if (SliderControlArea(rect).Contains(mouse)) {
+            } else if (OptionControlRect(rect).Contains(mouse)) {
                 draggedSlider = item;
-                int before = option.Index;
-                SetOptionFromMouse(item, option, SliderControlRect(rect), mouse.X);
-                if (TryGetOption(item, out OptionSnapshot changed) && changed.Index != before)
-                    MarkSettingsDirty();
+                // A discrete press always ticks; only the drag that follows is throttled.
+                if (SetOptionFromMouse(item, option, SliderControlRect(rect), mouse.X))
+                    sliderAudioCooldown = SliderAudioInterval;
             }
         } else if (TryGetIntSlider(item, out IntSliderSnapshot slider)) {
-            if (SliderControlArea(rect).Contains(mouse)) {
+            if (OptionControlRect(rect).Contains(mouse)) {
                 draggedSlider = item;
-                int before = slider.Value;
-                SetIntSliderFromMouse(item, slider, SliderControlRect(rect), mouse.X);
-                if (TryGetIntSlider(item, out IntSliderSnapshot changed) && changed.Value != before)
-                    MarkSettingsDirty();
+                if (SetIntSliderFromMouse(item, slider, SliderControlRect(rect), mouse.X))
+                    sliderAudioCooldown = SliderAudioInterval;
             }
         } else if (IsCompositeMenu(item)) {
             OpenCompositePopup(item);
@@ -961,27 +963,35 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             return;
         }
         if (draggedSlider is not { } dragged) return;
-        if (!TryGetRowPlacement(layout, dragged, out RowPlacement placement)) return;
+        if (!TryGetRowPlacement(layout, dragged, out RowPlacement placement)) {
+            draggedSlider = null;
+            return;
+        }
         if (TryGetOption(dragged, out OptionSnapshot option)
             && option.Kind == OptionKind.Range) {
-            int before = option.Index;
-            SetOptionFromMouse(dragged, option, SliderControlRect(placement.Rect), mouse.X);
-            if (TryGetOption(dragged, out OptionSnapshot changed) && changed.Index != before)
-                MarkSettingsDirty();
+            bool playSound = sliderAudioCooldown <= 0f;
+            if (SetOptionFromMouse(dragged, option, SliderControlRect(placement.Rect), mouse.X,
+                    playSound) && playSound) sliderAudioCooldown = SliderAudioInterval;
         } else if (TryGetIntSlider(dragged, out IntSliderSnapshot slider)) {
-            int before = slider.Value;
-            SetIntSliderFromMouse(dragged, slider, SliderControlRect(placement.Rect), mouse.X);
-            if (TryGetIntSlider(dragged, out IntSliderSnapshot changed) && changed.Value != before)
-                MarkSettingsDirty();
+            bool playSound = sliderAudioCooldown <= 0f;
+            if (SetIntSliderFromMouse(dragged, slider, SliderControlRect(placement.Rect), mouse.X,
+                    playSound) && playSound) sliderAudioCooldown = SliderAudioInterval;
         }
     }
 
+    private void CancelSliderDrag() => draggedSlider = null;
+
     private bool TryGetRowPlacement(ModOptionsLayout layout, TextMenu.Item item,
         out RowPlacement placement) {
-        foreach (RowPlacement candidate in RowPlacements(layout)) {
-            if (candidate.Item != item) continue;
-            placement = candidate;
-            return true;
+        float y = layout.Rows.Y - rowScroll.Offset;
+        foreach (RowEntry row in VisibleRows()) {
+            float height = RowHeight(row, layout.Rows.Width);
+            if (row.Item == item) {
+                placement = new RowPlacement(row.Item, row.Description,
+                    new MaterialRect(layout.Rows.X, y, layout.Rows.Width, height));
+                return true;
+            }
+            y += height + RowGap;
         }
         placement = default;
         return false;
@@ -995,7 +1005,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private void UpdateDropdown(ModOptionsLayout layout) {
         TextMenu.Item? item = dropdownItem;
         if (item is null || !item.Visible || !TryGetOption(item, out OptionSnapshot option)
-            || !CanUseDropdown(option)) {
+            || option.Kind != OptionKind.Dropdown) {
             CloseDropdown(playSound: false);
             return;
         }
@@ -1456,8 +1466,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         if (TryGetOption(item, out OptionSnapshot option)) {
             MaterialRect control = option.Kind switch {
                 OptionKind.Switch => SwitchControlArea(rect),
-                OptionKind.Dropdown => DropdownControlRect(rect),
-                _ => SliderControlArea(rect)
+                _ => OptionControlRect(rect)
             };
             RenderItemLabel(option.Label, rect, control.X - rect.X - 62f, labelColor, alpha,
                 hasDescription);
@@ -1471,7 +1480,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             return true;
         }
         if (TryGetIntSlider(item, out IntSliderSnapshot slider)) {
-            MaterialRect control = SliderControlArea(rect);
+            MaterialRect control = OptionControlRect(rect);
             RenderItemLabel(slider.Label, rect, control.X - rect.X - 62f, labelColor, alpha,
                 hasDescription);
             RenderIntSlider(slider, rect, palette, alpha, enabled);
@@ -1539,7 +1548,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
 
     private void RenderOptionControl(TextMenu.Item item, OptionSnapshot option, MaterialRect rect,
         MaterialPalette palette, float alpha, bool enabled) {
-        MaterialRect control = DropdownControlRect(rect);
+        MaterialRect control = OptionControlRect(rect);
         bool open = dropdownItem == item;
         MaterialUi.RoundedRect(control.X, control.Y, control.Width, control.Height, 16f,
             palette.Surface * (0.76f * alpha));
@@ -1831,6 +1840,31 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     }
 
     private static bool TryGetOption(TextMenu.Item item, out OptionSnapshot snapshot) {
+        OptionMetadata metadata = optionMetadata.GetValue(item, BuildOptionMetadata);
+        if (!metadata.Valid
+            || metadata.ValuesField?.GetValue(item) is not IEnumerable values) {
+            snapshot = default;
+            return false;
+        }
+        Delegate? change = metadata.ChangeField?.GetValue(item) as Delegate;
+        if (!ReferenceEquals(change, metadata.Change) || !ValuesMatch(metadata, values))
+            RefreshOptionMetadata(metadata, item, values, change);
+        snapshot = new OptionSnapshot(
+            metadata.LabelField!.GetValue(item)?.ToString() ?? "",
+            metadata.Kind,
+            Math.Clamp((int)(metadata.IndexField!.GetValue(item) ?? 0), 0,
+                Math.Max(0, metadata.Labels.Count - 1)),
+            metadata.Labels,
+            metadata.Entries,
+            metadata.IndexField!,
+            metadata.PreviousIndexField,
+            metadata.ChangeField
+        );
+        return true;
+    }
+
+    private static OptionMetadata BuildOptionMetadata(TextMenu.Item item) {
+        OptionMetadata metadata = new();
         FieldInfo? labelField = null;
         FieldInfo? indexField = null;
         FieldInfo? previousIndexField = null;
@@ -1847,31 +1881,47 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         }
         if (labelField is null || indexField is null || valuesField is null
             || indexField.FieldType != typeof(int)
-            || valuesField.GetValue(item) is not IEnumerable values) {
-            snapshot = default!;
-            return false;
-        }
-        List<string> labels = [];
-        List<object> entries = [];
+            || valuesField.GetValue(item) is not IEnumerable values) return metadata;
+        metadata.LabelField = labelField;
+        metadata.IndexField = indexField;
+        metadata.PreviousIndexField = previousIndexField;
+        metadata.ValuesField = valuesField;
+        metadata.ChangeField = changeField;
+        metadata.Valid = true;
+        RefreshOptionMetadata(metadata, item, values, changeField?.GetValue(item) as Delegate);
+        return metadata;
+    }
+
+    private static void RefreshOptionMetadata(OptionMetadata metadata, TextMenu.Item item,
+        IEnumerable values, Delegate? change) {
+        metadata.Labels.Clear();
+        metadata.Entries.Clear();
         foreach (object? entry in values) {
             if (entry is null) continue;
             object? label = entry.GetType().GetProperty("Item1")?.GetValue(entry)
                 ?? entry.GetType().GetField("Item1")?.GetValue(entry);
-            labels.Add(label?.ToString() ?? "");
-            entries.Add(entry);
+            metadata.Labels.Add(label?.ToString() ?? "");
+            metadata.Entries.Add(entry);
         }
-        Delegate? change = changeField?.GetValue(item) as Delegate;
-        snapshot = new OptionSnapshot(
-            labelField.GetValue(item)?.ToString() ?? "",
-            ClassifyOption(item, labels, entries, change),
-            Math.Clamp((int)(indexField.GetValue(item) ?? 0), 0, Math.Max(0, labels.Count - 1)),
-            labels,
-            entries,
-            indexField,
-            previousIndexField,
-            changeField
-        );
-        return true;
+        metadata.Change = change;
+        metadata.Kind = ClassifyOption(item, metadata.Labels, metadata.Entries, change);
+    }
+
+    private static bool ValuesMatch(OptionMetadata metadata, IEnumerable values) {
+        if (values is IList list && list.Count == metadata.Entries.Count) {
+            for (int index = 0; index < list.Count; index++) {
+                if (!ReferenceEquals(list[index], metadata.Entries[index])) return false;
+            }
+            return true;
+        }
+        int position = 0;
+        foreach (object? entry in values) {
+            if (entry is null) continue;
+            if (position >= metadata.Entries.Count
+                || !ReferenceEquals(metadata.Entries[position], entry)) return false;
+            position++;
+        }
+        return position == metadata.Entries.Count;
     }
 
     /// <summary>
@@ -1883,19 +1933,14 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         List<object> entries, Delegate? change) {
         if (item is TextMenu.Option<bool>) return OptionKind.Switch;
         bool isSlider = item is TextMenu.Slider;
-        bool isIntOption = item is TextMenu.Option<int>;
-        if (!isSlider && !isIntOption) return OptionKind.Dropdown;
+        if (!isSlider && item is not TextMenu.Option<int>) return OptionKind.Dropdown;
 
         bool? enumBacked = ChangeTargetsEnum(change);
         if (enumBacked is true) return OptionKind.Dropdown;
-        bool consecutive = HasConsecutiveInts(entries);
-        bool numericLabels = labels.Count > 0 && labels.All(LooksNumeric);
-        if (isSlider) {
-            if (enumBacked is false) return OptionKind.Range;
-            return consecutive && numericLabels ? OptionKind.Range : OptionKind.Dropdown;
-        }
-        // A hand-built Option<int> is only a range when its values really are a sequence.
-        return consecutive && numericLabels ? OptionKind.Range : OptionKind.Dropdown;
+        if (isSlider && enumBacked is false) return OptionKind.Range;
+        return HasConsecutiveInts(entries) && labels.Count > 0 && labels.All(LooksNumeric)
+            ? OptionKind.Range
+            : OptionKind.Dropdown;
     }
 
     private static bool? ChangeTargetsEnum(Delegate? change) {
@@ -1943,13 +1988,28 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
 
     private static bool LooksNumeric(string value) {
         string text = value.Trim();
+        if (double.TryParse(text, NumberStyles.Float | NumberStyles.AllowThousands,
+                CultureInfo.InvariantCulture, out double parsed) && double.IsFinite(parsed))
+            return true;
         int index = text.StartsWith('-') || text.StartsWith('+') ? 1 : 0;
-        int digits = 0;
+        bool digits = false;
         while (index < text.Length && char.IsDigit(text[index])) {
             index++;
-            digits++;
+            digits = true;
         }
-        return digits > 0;
+        if (!digits) return false;
+        if (index < text.Length && text[index] == '.') {
+            index++;
+            int fractionStart = index;
+            while (index < text.Length && char.IsDigit(text[index])) index++;
+            if (index == fractionStart) return false;
+        }
+        // Try to parse a short unit suffix ["1x", "80%", "10 fps"],
+        // but reject notes ["1 (recommended)"] and compound labels ["1280×720"].
+        // This is based on heuristics and not guaranteed to be accurate.
+        string suffix = text[index..].Trim();
+        return suffix.Length == 0 || suffix is "%" or "×"
+            || suffix.Length <= 6 && suffix.All(char.IsLetter);
     }
 
     private static object? EntryValue(object entry) =>
@@ -1961,11 +2021,8 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             snapshot = default;
             return false;
         }
-        Type type = typeof(TextMenuExt.IntSlider);
-        FieldInfo? minimumField = type.GetField("min", BindingFlags.Instance | BindingFlags.NonPublic);
-        FieldInfo? maximumField = type.GetField("max", BindingFlags.Instance | BindingFlags.NonPublic);
-        int minimum = (int)(minimumField?.GetValue(slider) ?? slider.Index);
-        int maximum = (int)(maximumField?.GetValue(slider) ?? slider.Index);
+        int minimum = (int)(intSliderMinimumField?.GetValue(slider) ?? slider.Index);
+        int maximum = (int)(intSliderMaximumField?.GetValue(slider) ?? slider.Index);
         snapshot = new IntSliderSnapshot(slider.Label, slider.Index, minimum, maximum);
         return true;
     }
@@ -2032,53 +2089,43 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         return false;
     }
 
-    private static bool CanUseDropdown(OptionSnapshot option) =>
-        option.Kind == OptionKind.Dropdown;
-
-    private static void SetOptionIndex(TextMenu.Item item, int targetIndex) {
-        if (!TryGetOption(item, out OptionSnapshot option) || option.Options.Count == 0) return;
+    private static bool SetOptionIndex(TextMenu.Item item, int targetIndex, bool playSound = true) {
+        if (!TryGetOption(item, out OptionSnapshot option) || option.Options.Count == 0) return false;
         targetIndex = Math.Clamp(targetIndex, 0, option.Options.Count - 1);
-        if (targetIndex == option.Index) return;
+        if (targetIndex == option.Index) return false;
         option.PreviousIndexField?.SetValue(item, option.Index);
         option.IndexField.SetValue(item, targetIndex);
-        object entry = option.Entries[targetIndex];
-        object? value = entry.GetType().GetProperty("Item2")?.GetValue(entry)
-            ?? entry.GetType().GetField("Item2")?.GetValue(entry);
+        object? value = EntryValue(option.Entries[targetIndex]);
         if (option.ChangeField?.GetValue(item) is Delegate changed) changed.DynamicInvoke(value);
         item.ValueWiggler?.Start();
-        Audio.Play(targetIndex > option.Index
-            ? "event:/ui/main/button_toggle_on"
-            : "event:/ui/main/button_toggle_off");
+        if (playSound) {
+            Audio.Play(targetIndex > option.Index
+                ? "event:/ui/main/button_toggle_on"
+                : "event:/ui/main/button_toggle_off");
+        }
+        return true;
     }
 
-    private static void SetOptionFromMouse(TextMenu.Item item, OptionSnapshot option,
-        MaterialRect track, float mouseX) {
-        if (option.Options.Count == 0) return;
+    private static bool SetOptionFromMouse(TextMenu.Item item, OptionSnapshot option,
+        MaterialRect track, float mouseX, bool playSound = true) {
+        if (option.Options.Count == 0) return false;
         float amount = Math.Clamp((mouseX - track.X) / Math.Max(1f, track.Width), 0f, 1f);
-        SetOptionIndex(item, (int)MathF.Round(amount * (option.Options.Count - 1)));
+        return SetOptionIndex(item, (int)MathF.Round(amount * (option.Options.Count - 1)),
+            playSound);
     }
 
-    private static void SetIntSliderFromMouse(TextMenu.Item item, IntSliderSnapshot slider,
-        MaterialRect track, float mouseX) {
-        if (item is not TextMenuExt.IntSlider intSlider) return;
+    private static bool SetIntSliderFromMouse(TextMenu.Item item, IntSliderSnapshot slider,
+        MaterialRect track, float mouseX, bool playSound = true) {
         float amount = Math.Clamp((mouseX - track.X) / Math.Max(1f, track.Width), 0f, 1f);
         int value = (int)MathF.Round(MathHelper.Lerp(slider.Minimum, slider.Maximum, amount));
-        value = Math.Clamp(value, slider.Minimum, slider.Maximum);
-        if (value == intSlider.Index) return;
-        intSlider.PreviousIndex = intSlider.Index;
-        intSlider.Index = value;
-        intSlider.OnValueChange?.Invoke(value);
-        intSlider.ValueWiggler?.Start();
-        Audio.Play(value > slider.Value
-            ? "event:/ui/main/button_toggle_on"
-            : "event:/ui/main/button_toggle_off");
+        return SetIntSliderValue(item, slider, value, playSound);
     }
 
     private MaterialRect DropdownRect(ModOptionsLayout layout, TextMenu.Item item, int optionCount) {
         RowPlacement? placement = RowPlacements(layout).FirstOrDefault(row => row.Item == item);
         MaterialRect control = placement is { Item: not null } row
-            ? DropdownControlRect(row.Rect)
-            : DropdownControlRect(new MaterialRect(layout.Rows.X, layout.Rows.Y, layout.Rows.Width, 78f));
+            ? OptionControlRect(row.Rect)
+            : OptionControlRect(new MaterialRect(layout.Rows.X, layout.Rows.Y, layout.Rows.Width, 78f));
         float height = DropdownVisibleCount(optionCount) * DropdownItemHeight + 12f;
         float y = control.Bottom + 6f;
         if (y + height > layout.Content.Bottom - 12f) y = control.Y - height - 6f;
@@ -2117,10 +2164,6 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         400f,
         48f
     );
-
-    private static MaterialRect DropdownControlRect(MaterialRect rect) => OptionControlRect(rect);
-
-    private static MaterialRect SliderControlArea(MaterialRect rect) => OptionControlRect(rect);
 
     private static MaterialRect SliderControlRect(MaterialRect rect) {
         MaterialRect control = OptionControlRect(rect);
@@ -2183,7 +2226,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     }
 
     private IEnumerator SaveAndFinishPause() {
-        yield return SaveSettingsAfterPending();
+        yield return Everest.SaveSettings();
         Level? level = pauseLevel;
         if (level is null) yield break;
         level.AllowHudHide = oldAllowHudHide;
@@ -2345,7 +2388,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         Range
     }
 
-    private sealed record OptionSnapshot(
+    private readonly record struct OptionSnapshot(
         string Label,
         OptionKind Kind,
         int Index,
@@ -2355,6 +2398,19 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         FieldInfo? PreviousIndexField,
         FieldInfo? ChangeField
     );
+
+    private sealed class OptionMetadata {
+        public bool Valid;
+        public FieldInfo? LabelField;
+        public FieldInfo? IndexField;
+        public FieldInfo? PreviousIndexField;
+        public FieldInfo? ValuesField;
+        public FieldInfo? ChangeField;
+        public Delegate? Change;
+        public OptionKind Kind;
+        public readonly List<string> Labels = [];
+        public readonly List<object> Entries = [];
+    }
 
     private readonly record struct IntSliderSnapshot(
         string Label,
