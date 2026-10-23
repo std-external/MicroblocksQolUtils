@@ -85,9 +85,12 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private TextMenu.Item? dropdownItem;
     private TextMenu.Item? compositePopupItem;
     private TextMenu.Item? draggedSlider;
-    private bool draggedSliderChanged;
     private int keyboardSliderDirection;
     private float keyboardSliderHold;
+    private float keyboardSliderAccumulator;
+    private float settingsSaveDelay = -1f;
+    private bool settingsSaveRunning;
+    private bool settingsDirty;
     private int dropdownHighlight;
     private int dropdownFirstVisible;
     private string tabSearchText = "";
@@ -165,7 +168,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         if (menu is not null) menu.Focused = false;
         SaveTabState();
         for (float timer = 0f; timer < 0.16f; timer += Engine.RawDeltaTime) yield return null;
-        yield return Everest.SaveSettings();
+        yield return SaveSettingsAfterPending();
         DetachMenu();
         Visible = false;
     }
@@ -203,6 +206,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         compositePopupScroll.Update(MaxCompositePopupScroll(layout));
         ease = Calc.Approach(ease, display ? 1f : 0f, Engine.RawDeltaTime * 7.5f);
         inputDelay -= Engine.RawDeltaTime;
+        UpdateSettingsSave();
         UpdateInteractions(layout);
 
         if (!display) {
@@ -761,17 +765,18 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         color == Color.OrangeRed || color == Color.Goldenrod || color == Color.Red || color == Color.Yellow;
 
     /// <summary>
-    /// Range settings use an adaptive keyboard step (about 50 presses for the whole range);
-    /// holding the direction accelerates after 0.4s (x2 / x4 / x8) and resets on release.
-    /// Mouse/touch dragging keeps its pixel-linear mapping.
+    /// A single tap always moves one minimum step. Holding starts a smooth ramp after
+    /// 0.45s: the rate grows from 0 to about range/12 steps per second (8..160), so the
+    /// same key is fine for nudging and fast for long ranges. A/D work as well as the
+    /// arrow keys. Mouse/touch dragging keeps its pixel-linear mapping.
     /// </summary>
     private bool HandleRangeKeyboard() {
         if (menu?.Current is not { } item) {
             ResetKeyboardSlider();
             return false;
         }
-        bool left = Input.MenuLeft.Check;
-        bool right = Input.MenuRight.Check;
+        bool left = Input.MenuLeft.Check || MInput.Keyboard.Check(Keys.A);
+        bool right = Input.MenuRight.Check || MInput.Keyboard.Check(Keys.D);
         int direction = left == right ? 0 : left ? -1 : 1;
         if (direction == 0) {
             ResetKeyboardSlider();
@@ -780,39 +785,78 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
 
         bool isRange = TryGetOption(item, out OptionSnapshot option)
             && option.Kind == OptionKind.Range;
-        bool isIntSlider = !isRange && TryGetIntSlider(item, out _);
+        IntSliderSnapshot slider = default;
+        bool isIntSlider = !isRange && TryGetIntSlider(item, out slider);
         if (!isRange && !isIntSlider) {
             ResetKeyboardSlider();
             return false;
         }
 
         if (direction != keyboardSliderDirection) {
+            // The first tap is always exactly one minimum step; repeated events are ignored
+            // below because the hold timer owns the acceleration.
             keyboardSliderDirection = direction;
             keyboardSliderHold = 0f;
+            keyboardSliderAccumulator = 0f;
+            if (isRange) SetOptionIndex(item, option.Index + direction);
+            else SetIntSliderValue(item, slider, slider.Value + direction);
+            MarkSettingsDirty();
+            return true;
         }
-        keyboardSliderHold += Engine.RawDeltaTime;
-        bool pressed = left ? Input.MenuLeft.Pressed : Input.MenuRight.Pressed;
-        if (!pressed) return true; // consume held input; do not let TextMenu move one step
 
-        int multiplier = keyboardSliderHold >= 1.2f ? 8
-            : keyboardSliderHold >= 0.8f ? 4
-            : keyboardSliderHold >= 0.4f ? 2
-            : 1;
-        if (isRange) {
-            int span = Math.Max(1, option.Options.Count - 1);
-            int step = Math.Max(1, (int)MathF.Round(span / 50f));
-            SetOptionIndex(item, option.Index + direction * step * multiplier);
-        } else if (TryGetIntSlider(item, out IntSliderSnapshot slider)) {
-            int span = Math.Max(1, slider.Maximum - slider.Minimum);
-            int step = Math.Max(1, (int)MathF.Round(span / 50f));
-            SetIntSliderValue(item, slider, slider.Value + direction * step * multiplier);
-        }
+        keyboardSliderHold += Engine.RawDeltaTime;
+        const float delay = 0.45f;
+        const float ramp = 1.0f;
+        if (keyboardSliderHold <= delay) return true;
+
+        int span = isRange ? Math.Max(1, option.Options.Count - 1)
+            : Math.Max(1, slider.Maximum - slider.Minimum);
+        float maxRate = Math.Clamp(span / 12f, 8f, 160f);
+        float progress = Math.Clamp((keyboardSliderHold - delay) / ramp, 0f, 1f);
+        progress = progress * progress * (3f - 2f * progress);
+        keyboardSliderAccumulator += maxRate * progress * Engine.RawDeltaTime;
+        int steps = (int)keyboardSliderAccumulator;
+        if (steps <= 0) return true;
+        keyboardSliderAccumulator -= steps;
+
+        if (isRange) SetOptionIndex(item, option.Index + direction * steps);
+        else SetIntSliderValue(item, slider, slider.Value + direction * steps);
+        MarkSettingsDirty();
         return true;
     }
 
     private void ResetKeyboardSlider() {
         keyboardSliderDirection = 0;
         keyboardSliderHold = 0f;
+        keyboardSliderAccumulator = 0f;
+    }
+
+    private void MarkSettingsDirty() {
+        settingsDirty = true;
+        settingsSaveDelay = 0.5f;
+    }
+
+    private void UpdateSettingsSave() {
+        if (settingsSaveDelay < 0f || settingsSaveRunning || !display) return;
+        // Do not write while a slider is still being dragged or a direction key is held.
+        if (draggedSlider is not null || keyboardSliderDirection != 0) return;
+        settingsSaveDelay -= Engine.RawDeltaTime;
+        if (settingsSaveDelay > 0f || !settingsDirty) return;
+        settingsDirty = false;
+        settingsSaveDelay = -1f;
+        Add(new Coroutine(SaveSettingsDebounced()));
+    }
+
+    private IEnumerator SaveSettingsDebounced() {
+        settingsSaveRunning = true;
+        yield return Everest.SaveSettings();
+        settingsSaveRunning = false;
+    }
+
+    private IEnumerator SaveSettingsAfterPending() {
+        settingsSaveDelay = -1f;
+        while (settingsSaveRunning) yield return null;
+        yield return Everest.SaveSettings();
     }
 
     private static void SetIntSliderValue(TextMenu.Item item, IntSliderSnapshot slider, int value) {
@@ -887,20 +931,18 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
                 OpenDropdown(item, option);
             } else if (SliderControlArea(rect).Contains(mouse)) {
                 draggedSlider = item;
-                draggedSliderChanged = false;
                 int before = option.Index;
                 SetOptionFromMouse(item, option, SliderControlRect(rect), mouse.X);
                 if (TryGetOption(item, out OptionSnapshot changed) && changed.Index != before)
-                    draggedSliderChanged = true;
+                    MarkSettingsDirty();
             }
         } else if (TryGetIntSlider(item, out IntSliderSnapshot slider)) {
             if (SliderControlArea(rect).Contains(mouse)) {
                 draggedSlider = item;
-                draggedSliderChanged = false;
                 int before = slider.Value;
                 SetIntSliderFromMouse(item, slider, SliderControlRect(rect), mouse.X);
                 if (TryGetIntSlider(item, out IntSliderSnapshot changed) && changed.Value != before)
-                    draggedSliderChanged = true;
+                    MarkSettingsDirty();
             }
         } else if (IsCompositeMenu(item)) {
             OpenCompositePopup(item);
@@ -913,10 +955,6 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private void UpdateSliderDrag(ModOptionsLayout layout, Vector2 mouse) {
         if (!MaterialTouch.CheckLeftButton) {
             draggedSlider = null;
-            if (draggedSliderChanged) {
-                draggedSliderChanged = false;
-                Add(new Coroutine(Everest.SaveSettings()));
-            }
             return;
         }
         if (draggedSlider is not { } dragged) return;
@@ -926,12 +964,12 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             int before = option.Index;
             SetOptionFromMouse(dragged, option, SliderControlRect(placement.Rect), mouse.X);
             if (TryGetOption(dragged, out OptionSnapshot changed) && changed.Index != before)
-                draggedSliderChanged = true;
+                MarkSettingsDirty();
         } else if (TryGetIntSlider(dragged, out IntSliderSnapshot slider)) {
             int before = slider.Value;
             SetIntSliderFromMouse(dragged, slider, SliderControlRect(placement.Rect), mouse.X);
             if (TryGetIntSlider(dragged, out IntSliderSnapshot changed) && changed.Value != before)
-                draggedSliderChanged = true;
+                MarkSettingsDirty();
         }
     }
 
@@ -2142,7 +2180,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     }
 
     private IEnumerator SaveAndFinishPause() {
-        yield return Everest.SaveSettings();
+        yield return SaveSettingsAfterPending();
         Level? level = pauseLevel;
         if (level is null) yield break;
         level.AllowHudHide = oldAllowHudHide;
