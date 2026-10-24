@@ -388,6 +388,7 @@ function installLinuxVplRuntime(output) {
     "/usr/share/doc/libvpl2/copyright",
     vplPrefix ? resolve(vplPrefix, "share", "licenses", "oneVPL", "LICENSE") : null,
     vplPrefix ? resolve(vplPrefix, "share", "licenses", "libvpl", "LICENSE") : null,
+    vplPrefix ? resolve(vplPrefix, "share", "licenses", "libvpl", "license.txt") : null,
     vplPrefix ? resolve(vplPrefix, "share", "licenses", "vpl", "LICENSE") : null,
   ]);
   if (!license) throw new Error("libvpl license file was not found after the FFmpeg build");
