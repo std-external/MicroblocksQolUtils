@@ -1,5 +1,4 @@
 using System.Collections;
-using System.Globalization;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using Celeste.Mod.UI;
@@ -1904,7 +1903,13 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             metadata.Entries.Add(entry);
         }
         metadata.Change = change;
-        metadata.Kind = ClassifyOption(item, metadata.Labels, metadata.Entries, change);
+        metadata.Kind = OptionRules.Classify(
+            item is TextMenu.Option<bool>,
+            item is TextMenu.Slider,
+            item is TextMenu.Option<int>,
+            OptionRules.ChangeTargetsEnum(change),
+            metadata.Labels,
+            metadata.Entries);
     }
 
     private static bool ValuesMatch(OptionMetadata metadata, IEnumerable values) {
@@ -1923,98 +1928,6 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         }
         return position == metadata.Entries.Count;
     }
-
-    /// <summary>
-    /// TextMenu.Option only knows its value type via a generic argument, and Everest uses
-    /// Slider for both integer ranges and enums. Classify by the backing property when the
-    /// change delegate exposes one, and fall back to the value/label shape otherwise.
-    /// </summary>
-    private static OptionKind ClassifyOption(TextMenu.Item item, List<string> labels,
-        List<object> entries, Delegate? change) {
-        if (item is TextMenu.Option<bool>) return OptionKind.Switch;
-        bool isSlider = item is TextMenu.Slider;
-        if (!isSlider && item is not TextMenu.Option<int>) return OptionKind.Dropdown;
-
-        bool? enumBacked = ChangeTargetsEnum(change);
-        if (enumBacked is true) return OptionKind.Dropdown;
-        if (isSlider && enumBacked is false) return OptionKind.Range;
-        return HasConsecutiveInts(entries) && labels.Count > 0 && labels.All(LooksNumeric)
-            ? OptionKind.Range
-            : OptionKind.Dropdown;
-    }
-
-    private static bool? ChangeTargetsEnum(Delegate? change) {
-        object? target = change?.Target;
-        if (target is null) return null;
-        bool sawEnum = false;
-        bool sawNumeric = false;
-        foreach (FieldInfo field in target.GetType().GetFields(
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)) {
-            object? value;
-            try {
-                value = field.GetValue(target);
-            } catch {
-                continue;
-            }
-            if (value is PropertyInfo property) {
-                if (property.PropertyType.IsEnum) sawEnum = true;
-                else if (IsNumericType(property.PropertyType)) sawNumeric = true;
-            } else if (value is Array array && array.GetType().GetElementType()?.IsEnum == true) {
-                sawEnum = true;
-            } else if (field.FieldType.IsEnum) {
-                sawEnum = true;
-            }
-        }
-        // A compiler display class can capture several properties from the enclosing scope;
-        // only trust the answer when the captured property types are unambiguous.
-        if (sawEnum && !sawNumeric) return true;
-        if (sawNumeric && !sawEnum) return false;
-        return null;
-    }
-
-    private static bool IsNumericType(Type type) =>
-        type == typeof(int) || type == typeof(float) || type == typeof(double)
-        || type == typeof(long) || type == typeof(short) || type == typeof(byte);
-
-    private static bool HasConsecutiveInts(List<object> entries) {
-        int? previous = null;
-        foreach (object entry in entries) {
-            if (EntryValue(entry) is not int value) return false;
-            if (previous.HasValue && value != previous.Value + 1) return false;
-            previous = value;
-        }
-        return previous.HasValue;
-    }
-
-    private static bool LooksNumeric(string value) {
-        string text = value.Trim();
-        if (double.TryParse(text, NumberStyles.Float | NumberStyles.AllowThousands,
-                CultureInfo.InvariantCulture, out double parsed) && double.IsFinite(parsed))
-            return true;
-        int index = text.StartsWith('-') || text.StartsWith('+') ? 1 : 0;
-        bool digits = false;
-        while (index < text.Length && char.IsDigit(text[index])) {
-            index++;
-            digits = true;
-        }
-        if (!digits) return false;
-        if (index < text.Length && text[index] == '.') {
-            index++;
-            int fractionStart = index;
-            while (index < text.Length && char.IsDigit(text[index])) index++;
-            if (index == fractionStart) return false;
-        }
-        // Try to parse a short unit suffix ["1x", "80%", "10 fps"],
-        // but reject notes ["1 (recommended)"] and compound labels ["1280×720"].
-        // This is based on heuristics and not guaranteed to be accurate.
-        string suffix = text[index..].Trim();
-        return suffix.Length == 0 || suffix is "%" or "×"
-            || suffix.Length <= 6 && suffix.All(char.IsLetter);
-    }
-
-    private static object? EntryValue(object entry) =>
-        entry.GetType().GetProperty("Item2")?.GetValue(entry)
-        ?? entry.GetType().GetField("Item2")?.GetValue(entry);
 
     private static bool TryGetIntSlider(TextMenu.Item item, out IntSliderSnapshot snapshot) {
         if (item is not TextMenuExt.IntSlider slider) {
@@ -2095,7 +2008,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         if (targetIndex == option.Index) return false;
         option.PreviousIndexField?.SetValue(item, option.Index);
         option.IndexField.SetValue(item, targetIndex);
-        object? value = EntryValue(option.Entries[targetIndex]);
+        object? value = OptionRules.EntryValue(option.Entries[targetIndex]);
         if (option.ChangeField?.GetValue(item) is Delegate changed) changed.DynamicInvoke(value);
         item.ValueWiggler?.Start();
         if (playSound) {
@@ -2381,12 +2294,6 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     }
 
     private readonly record struct TabVisual(string Icon, Color Accent);
-
-    private enum OptionKind {
-        Switch,
-        Dropdown,
-        Range
-    }
 
     private readonly record struct OptionSnapshot(
         string Label,

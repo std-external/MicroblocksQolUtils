@@ -14,6 +14,7 @@ const argumentValue = (name) => {
 };
 const target = argumentValue("--target");
 const disableFfmpeg = process.argv.includes("--no-ffmpeg");
+const disableTests = process.argv.includes("--no-tests");
 if (disableFfmpeg && process.argv.includes("--install")) {
   throw new Error("Cannot install a --no-ffmpeg build: it cannot record videos. Remove --no-ffmpeg to build and install the complete mod.");
 }
@@ -108,6 +109,19 @@ if (!existsSync(nativeOutput)) {
   throw new Error(`The native library was not produced at ${nativeOutput}`);
 }
 run("dotnet", ["build", resolve(root, "Source/MicroblocksQolUtils.csproj"), "-c", "Release"]);
+if (!disableTests) {
+  // ModOptions.Integration exercises real TextMenu items, so it needs runnable game
+  // assemblies from CELESTE_ROOT; ModOptions only links Source/OptionRules.cs and
+  // always runs.
+  const testEnvironment = { ...process.env, CELESTE_ROOT: celesteRoot };
+  for (const project of [
+    "Tests/ModOptions/ModOptions.csproj",
+    "Tests/ModOptions.Integration/ModOptions.Integration.csproj",
+  ]) {
+    console.log(`Testing ${project}`);
+    run("dotnet", ["run", "--project", resolve(root, project), "-c", "Release"], testEnvironment);
+  }
+}
 rmSync(output, { recursive: true, force: true });
 mkdirSync(resolve(output, "Code"), { recursive: true });
 cpSync(dll, resolve(output, "Code/MicroblocksQolUtils.dll"));
