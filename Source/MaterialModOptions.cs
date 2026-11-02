@@ -91,7 +91,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private float inputDelay;
     internal bool AcceptsTouch => Visible && Active && display && inputDelay <= 0 && ease > 0.99f
         && (pauseLevel is not null || Selected && Focused);
-    private string TouchContext => $"mods:{selectedTab}:{tabSearchText}:{settingSearchText}:{dropdownItem?.GetHashCode()}:{compositePopupItem?.GetHashCode()}";
+    private string TouchContext => $"mods:{selectedTab}:{tabSearch.Text}:{settingSearch.Text}:{dropdownItem?.GetHashCode()}:{compositePopupItem?.GetHashCode()}";
     private CloseDestination closeDestination;
     private bool saveStarted;
     private string? savedTabId;
@@ -105,8 +105,10 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private float sliderAudioCooldown;
     private int dropdownHighlight;
     private int dropdownFirstVisible;
-    private string tabSearchText = "";
-    private string settingSearchText = "";
+    private readonly TextEditBuffer tabSearch = new("", SearchTextLimit);
+    private readonly TextEditBuffer settingSearch = new("", SearchTextLimit);
+    private readonly TextKeyRepeat searchLeftRepeat = new();
+    private readonly TextKeyRepeat searchRightRepeat = new();
     private string imeText = "";
     private SearchTarget searchTarget;
     private bool configOverlayOpen;
@@ -119,6 +121,8 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     private string inlineIme = "";
     private bool inlineInputSubscribed;
     private float inlineError;
+    private readonly TextKeyRepeat inlineLeftRepeat = new();
+    private readonly TextKeyRepeat inlineRightRepeat = new();
 
     public bool SuppressNormalRender { get; set; }
 
@@ -676,7 +680,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             : currentTabId;
         RebuildTabs(destination, remove ? null : item);
         if (tabs[selectedTab].Id != destination && currentTabId == "__favorites" && remove) {
-            tabSearchText = "";
+            tabSearch.SetText("");
             RebuildTabs(sourceTabId, item);
         }
         rowScroll.Reset();
@@ -730,6 +734,8 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         inlineText = new TextEditBuffer(setting.Value(), setting.MaxLength);
         inlineIme = "";
         inlineError = 0f;
+        inlineLeftRepeat.Reset();
+        inlineRightRepeat.Reset();
         Audio.Play("event:/ui/main/savefile_rename_start");
         SubscribeInlineInput();
         MaterialTextInputFocus.Focus(this);
@@ -749,11 +755,22 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             CommitInlineEdit();
             return;
         }
-        if (MaterialTextInputFocus.Pressed(Keys.Left)) inlineText.MoveLeft();
-        else if (MaterialTextInputFocus.Pressed(Keys.Right)) inlineText.MoveRight();
-        else if (MaterialTextInputFocus.Pressed(Keys.Home)) inlineText.MoveHome();
-        else if (MaterialTextInputFocus.Pressed(Keys.End)) inlineText.MoveEnd();
-        else if (MaterialTextInputFocus.Pressed(Keys.Delete)) inlineText.Delete();
+        bool extend = MaterialTextInputFocus.ShiftDown;
+        if (TextEditShortcuts.Handle(inlineText)) {
+            inlineIme = "";
+            inlineError = 0f;
+        } else {
+            // Left/right repeat while held, like a native text box; Home/End/Delete are single-shot.
+            bool left = inlineLeftRepeat.Update(MaterialTextInputFocus.Down(Keys.Left),
+                Engine.RawDeltaTime);
+            bool right = inlineRightRepeat.Update(MaterialTextInputFocus.Down(Keys.Right),
+                Engine.RawDeltaTime);
+            if (left) inlineText.MoveLeft(extend);
+            else if (right) inlineText.MoveRight(extend);
+            else if (MaterialTextInputFocus.Pressed(Keys.Home)) inlineText.MoveHome(extend);
+            else if (MaterialTextInputFocus.Pressed(Keys.End)) inlineText.MoveEnd(extend);
+            else if (MaterialTextInputFocus.Pressed(Keys.Delete)) inlineText.Delete();
+        }
 
         if (!MaterialTouch.PressedLeftButton) return;
         MaterialRect? field = null;
@@ -771,10 +788,11 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             return;
         }
         // Click inside the field moves the caret to the nearest character boundary.
-        TextEditBuffer.TextWindow window = inlineText.Window(
+        TextEditGeometry.TextWindow window = TextEditGeometry.Window(inlineText,
             control.Width - 62f, 0.27f, UiFontWeight.Bold);
-        inlineText.SetCursorFromX(MaterialTouch.Position.X - (control.X + 15f), window,
-            0.27f, UiFontWeight.Bold);
+        inlineText.SetCursor(TextEditGeometry.IndexFromX(inlineText,
+            MaterialTouch.Position.X - (control.X + 15f), window, 0.27f, UiFontWeight.Bold), extend);
+        inlineIme = "";
     }
 
     private void OnInlineInput(char character) {
@@ -824,6 +842,8 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         inlineText = null;
         inlineIme = "";
         inlineError = 0f;
+        inlineLeftRepeat.Reset();
+        inlineRightRepeat.Reset();
         ReleaseInlineInput();
         if (menu is not null) menu.Focused = searchTarget == SearchTarget.None;
     }
@@ -1033,13 +1053,11 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         Vector2 mouse = MaterialTouch.Position;
         if (MaterialTouch.PressedLeftButton) {
             if (layout.TabSearch.Contains(mouse)) {
-                SetSearchTarget(SearchTarget.Tabs);
-                Audio.Play("event:/ui/main/button_select");
+                FocusSearch(SearchTarget.Tabs, layout.TabSearch, mouse);
                 return true;
             }
             if (layout.SettingSearch.Contains(mouse)) {
-                SetSearchTarget(SearchTarget.Settings);
-                Audio.Play("event:/ui/main/button_select");
+                FocusSearch(SearchTarget.Settings, layout.SettingSearch, mouse);
                 return true;
             }
         }
@@ -1065,7 +1083,42 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             SetSearchTarget(SearchTarget.None);
             return false;
         }
+        TextEditBuffer buffer = SearchBuffer(searchTarget);
+        if (TextEditShortcuts.Handle(buffer)) {
+            imeText = "";
+            SearchChanged();
+            return true;
+        }
+        UpdateSearchCaret(buffer);
         return true;
+    }
+
+    /// <summary>Clicking a search box focuses it and drops the caret at the nearest character.</summary>
+    private void FocusSearch(SearchTarget target, MaterialRect rect, Vector2 mouse) {
+        SetSearchTarget(target);
+        TextEditBuffer buffer = SearchBuffer(target);
+        TextEditGeometry.TextWindow window = TextEditGeometry.Window(buffer, rect.Width - 74f,
+            0.28f, UiFontWeight.Regular);
+        buffer.SetCursor(TextEditGeometry.IndexFromX(buffer, mouse.X - (rect.X + 54f), window,
+            0.28f, UiFontWeight.Regular), MaterialTextInputFocus.ShiftDown);
+        Audio.Play("event:/ui/main/button_select");
+    }
+
+    private TextEditBuffer SearchBuffer(SearchTarget target) =>
+        target == SearchTarget.Tabs ? tabSearch : settingSearch;
+
+    private void UpdateSearchCaret(TextEditBuffer buffer) {
+        bool shift = MaterialTextInputFocus.ShiftDown;
+        // Left/right repeat while held, like a native text box; Home/End/Delete stay single-shot.
+        bool left = searchLeftRepeat.Update(MaterialTextInputFocus.Down(Keys.Left),
+            Engine.RawDeltaTime);
+        bool right = searchRightRepeat.Update(MaterialTextInputFocus.Down(Keys.Right),
+            Engine.RawDeltaTime);
+        if (left) buffer.MoveLeft(shift);
+        else if (right) buffer.MoveRight(shift);
+        else if (MaterialTextInputFocus.Pressed(Keys.Home)) buffer.MoveHome(shift);
+        else if (MaterialTextInputFocus.Pressed(Keys.End)) buffer.MoveEnd(shift);
+        else if (MaterialTextInputFocus.Pressed(Keys.Delete)) buffer.Delete();
     }
 
     private void SetSearchTarget(SearchTarget target) {
@@ -1074,6 +1127,12 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         bool isFocused = target != SearchTarget.None;
         searchTarget = target;
         imeText = "";
+        searchLeftRepeat.Reset();
+        searchRightRepeat.Reset();
+        if (wasFocused && !isFocused) {
+            tabSearch.CollapseSelection();
+            settingSearch.CollapseSelection();
+        }
         if (!wasFocused && isFocused) {
             TextInput.OnInput += OnTextInput;
             TextInputEXT.TextEditing += OnTextEditing;
@@ -1087,17 +1146,11 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
 
     private void OnTextInput(char character) {
         if (searchTarget == SearchTarget.None) return;
-        ref string value = ref searchTarget == SearchTarget.Tabs
-            ? ref tabSearchText
-            : ref settingSearchText;
-        if (character == '\b') {
-            if (value.Length == 0) return;
-            value = value[..^1];
-        } else if (!char.IsControl(character) && value.Length < SearchTextLimit) {
-            value += character;
-        } else {
-            return;
-        }
+        TextEditBuffer buffer = SearchBuffer(searchTarget);
+        bool changed = character == '\b'
+            ? buffer.Backspace()
+            : !char.IsControl(character) && buffer.Insert(character);
+        if (!changed) return;
         imeText = "";
         SearchChanged();
     }
@@ -1124,7 +1177,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
 
     private List<int> FilteredTabIndices() {
         List<int> result = [];
-        string search = tabSearchText.Trim();
+        string search = tabSearch.Text.Trim();
         for (int index = 0; index < tabs.Count; index++) {
             ModTab tab = tabs[index];
             if (search.Length == 0
@@ -1137,7 +1190,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
     }
 
     private bool MatchesSettingSearch(ModTab tab, TextMenu.Item item) {
-        string search = settingSearchText.Trim();
+        string search = settingSearch.Text.Trim();
         if (search.Length == 0 || item is TextMenuExt.EaseInSubHeaderExt) return true;
         if (TryGetSearchLabel(item, out string label)
             && label.Contains(search, StringComparison.CurrentCultureIgnoreCase)) return true;
@@ -1698,10 +1751,10 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         }
         List<MaterialInteractionTarget> targets = [
             new MaterialInteractionTarget("mod-options.search.tabs", layout.TabSearch,
-                Focused: searchTarget == SearchTarget.Tabs, TouchKind: "text", TouchText: tabSearchText,
+                Focused: searchTarget == SearchTarget.Tabs, TouchKind: "text", TouchText: tabSearch.Text,
                 TouchMaxLength: SearchTextLimit, TouchTextChanged: value => TouchSearch(SearchTarget.Tabs, value)),
             new MaterialInteractionTarget("mod-options.search.settings", layout.SettingSearch,
-                Focused: searchTarget == SearchTarget.Settings, TouchKind: "text", TouchText: settingSearchText,
+                Focused: searchTarget == SearchTarget.Settings, TouchKind: "text", TouchText: settingSearch.Text,
                 TouchMaxLength: SearchTextLimit, TouchTextChanged: value => TouchSearch(SearchTarget.Settings, value))
         ];
         // Modal popups own their entire input surface. Their existing hit testing
@@ -1757,15 +1810,15 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
 
     private void TouchSearch(SearchTarget target, string value) {
         SetSearchTarget(target);
-        if (target == SearchTarget.Tabs) tabSearchText = value;
-        else settingSearchText = value;
+        if (target == SearchTarget.Tabs) tabSearch.SetText(value);
+        else settingSearch.SetText(value);
         SearchChanged();
         SetSearchTarget(SearchTarget.None);
     }
 
     private void RenderTabs(ModOptionsLayout layout, MaterialPalette palette, float alpha) {
         MaterialSplitPageChrome.RenderNavigationSurface(layout.Navigation, palette, alpha);
-        RenderSearchBox(layout.TabSearch, tabSearchText, searchTarget == SearchTarget.Tabs,
+        RenderSearchBox(layout.TabSearch, tabSearch, searchTarget == SearchTarget.Tabs,
             UiText("microblocks_qol_modoptions_search_tabs", "搜索模组…"), "mod-options.search.tabs",
             palette, alpha);
         MaterialUiKit.Text(UiText("microblocks_qol_modoptions_mods", "模组与分类"),
@@ -1823,7 +1876,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             MaterialUiKit.Chip(tab.Version, new Vector2(layout.SettingSearch.X - 16f, layout.ContentHeader.Y + 13f),
                 palette, selected: false, alpha);
         }
-        RenderSearchBox(layout.SettingSearch, settingSearchText, searchTarget == SearchTarget.Settings,
+        RenderSearchBox(layout.SettingSearch, settingSearch, searchTarget == SearchTarget.Settings,
             UiText("microblocks_qol_modoptions_search_settings", "搜索当前设置…"),
             "mod-options.search.settings", palette, alpha);
 
@@ -1877,7 +1930,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             if (!renderedAny) {
                 string empty = FilteredTabIndices().Count == 0
                     ? UiText("microblocks_qol_modoptions_no_tabs", "没有匹配的模组")
-                    : string.IsNullOrWhiteSpace(settingSearchText)
+                    : string.IsNullOrWhiteSpace(settingSearch.Text)
                     ? UiText("microblocks_qol_modoptions_empty", "没有可用设置")
                     : UiText("microblocks_qol_modoptions_no_settings", "没有匹配的设置");
                 MaterialUiKit.Text(empty,
@@ -2079,10 +2132,13 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         bool empty;
         Color textColor;
         if (editing && inlineText is not null) {
-            TextEditBuffer.TextWindow window = inlineText.Window(textWidth, 0.27f,
-                UiFontWeight.Bold);
-            string before = window.Text[..Math.Clamp(window.CaretOffset, 0, window.Text.Length)];
-            string after = window.Text[Math.Clamp(window.CaretOffset, 0, window.Text.Length)..];
+            TextEditGeometry.TextWindow window = TextEditGeometry.Window(inlineText, textWidth,
+                0.27f, UiFontWeight.Bold);
+            int caret = Math.Clamp(window.CaretOffset, 0, window.Text.Length);
+            string before = window.Text[..caret];
+            string after = window.Text[caret..];
+            RenderTextSelection(inlineText, window, control.X + 15f, control.Center.Y, palette,
+                alpha, 0.27f, UiFontWeight.Bold);
             shown = before + inlineIme + after;
             empty = shown.Length == 0;
             textColor = palette.OnSurface;
@@ -2095,7 +2151,7 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
             }
             SetTextInputRectangle(control);
         } else {
-            shown = TextEditBuffer.Visible(setting.Value());
+            shown = setting.Value();
             empty = shown.Length == 0;
             textColor = empty ? palette.OnSurfaceVariant * 0.72f : palette.OnSurface;
             MaterialUiKit.Icon("edit", new Vector2(control.Right - 26f, control.Center.Y), 20f,
@@ -2149,8 +2205,8 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         }
     }
 
-    private void RenderSearchBox(MaterialRect rect, string value, bool focused, string placeholder,
-        string interactionKey, MaterialPalette palette, float alpha) {
+    private void RenderSearchBox(MaterialRect rect, TextEditBuffer buffer, bool focused,
+        string placeholder, string interactionKey, MaterialPalette palette, float alpha) {
         MaterialUi.RoundedRect(rect.X, rect.Y, rect.Width, rect.Height, rect.Height / 2f,
             (focused ? palette.SurfaceHighest : palette.SurfaceHigh) * (0.96f * alpha));
         motion.RenderStateLayer(interactionKey, rect, rect.Height / 2f, palette.Primary, alpha);
@@ -2160,27 +2216,52 @@ public sealed class MaterialModOptions : Oui, IMaterialAcrylicPage, IMaterialAcr
         }
         MaterialUiKit.Icon("search", new Vector2(rect.X + 27f, rect.Center.Y), 22f,
             focused ? palette.Primary : palette.OnSurfaceVariant, alpha);
-        string shown = value + (focused ? imeText : "");
-        string text = shown.Length == 0 ? placeholder : shown;
-        Color color = shown.Length == 0 ? palette.OnSurfaceVariant * 0.64f : palette.OnSurface;
+        float textWidth = rect.Width - 74f;
         Vector2 textPosition = new(rect.X + 54f, rect.Center.Y);
-        string visibleText = MaterialTextUtil.Ellipsize(text, rect.Width - 74f, 0.28f);
-        SystemTtfFont.DrawVisual(visibleText, textPosition, new Vector2(0f, 0.5f), 0.28f, color * alpha);
+        string before = "";
+        string after = buffer.Text;
+        if (focused) {
+            TextEditGeometry.TextWindow window = TextEditGeometry.Window(buffer, textWidth, 0.28f,
+                UiFontWeight.Regular);
+            int caret = Math.Clamp(window.CaretOffset, 0, window.Text.Length);
+            before = window.Text[..caret];
+            after = window.Text[caret..];
+            RenderTextSelection(buffer, window, textPosition.X, rect.Center.Y, palette, alpha,
+                0.28f, UiFontWeight.Regular);
+        }
+        string shown = before + (focused ? imeText : "") + after;
+        bool empty = shown.Length == 0;
+        string text = empty ? placeholder : shown;
+        Color color = empty ? palette.OnSurfaceVariant * 0.64f : palette.OnSurface;
+        SystemTtfFont.DrawVisual(MaterialTextUtil.Ellipsize(text, textWidth, 0.28f), textPosition,
+            new Vector2(0f, 0.5f), 0.28f, color * alpha);
         if (focused && Scene.BetweenInterval(0.5f)) {
-            string visibleInput = MaterialTextUtil.Ellipsize(shown, rect.Width - 74f, 0.28f);
-            float caretX = textPosition.X + SystemTtfFont.MeasureVisible(visibleInput, 0.28f).X + 2f;
+            float caretX = Math.Min(rect.Right - 12f, textPosition.X
+                + SystemTtfFont.MeasureVisible(before + imeText, 0.28f).X + 2f);
             MaterialUi.Line(new Vector2(caretX, rect.Y + 9f), new Vector2(caretX, rect.Bottom - 9f),
                 2f, palette.Primary * alpha);
         }
         if (!focused) return;
-        float xScale = Engine.ViewWidth / ScreenWidth;
-        float yScale = Engine.ViewHeight / ScreenHeight;
-        TextInputEXT.SetInputRectangle(new Rectangle(
-            (int)(rect.X * xScale),
-            (int)(rect.Y * yScale),
-            Math.Max(1, (int)(rect.Width * xScale)),
-            Math.Max(1, (int)(rect.Height * yScale))
-        ));
+        SetTextInputRectangle(rect);
+    }
+
+    /// <summary>
+    /// Draws the selection highlight behind a text run. <paramref name="window"/> tells where the
+    /// visible slice starts so a selection that scrolled out of the field is clipped correctly.
+    /// </summary>
+    private static void RenderTextSelection(TextEditBuffer buffer, TextEditGeometry.TextWindow window,
+        float textX, float centerY, MaterialPalette palette, float alpha, float scale,
+        UiFontWeight weight) {
+        if (!buffer.HasSelection) return;
+        int from = Math.Clamp(buffer.SelectionStart - window.Start, 0, window.Text.Length);
+        int to = Math.Clamp(buffer.SelectionStart + buffer.SelectionLength - window.Start, 0,
+            window.Text.Length);
+        if (to <= from) return;
+        float left = textX + SystemTtfFont.MeasureVisible(window.Text[..from], scale, weight).X;
+        float right = textX + SystemTtfFont.MeasureVisible(window.Text[..to], scale, weight).X;
+        if (right - left <= 0.5f) return;
+        MaterialUi.RoundedRect(left, centerY - 11f, right - left, 22f, 4f,
+            palette.Primary * (alpha * 0.30f));
     }
 
     private void RenderDropdown(ModOptionsLayout layout, MaterialPalette palette, float alpha) {

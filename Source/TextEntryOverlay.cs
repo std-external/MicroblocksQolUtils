@@ -191,8 +191,10 @@ internal sealed class TextEntryOverlay : Entity {
 
     private void SetCursorFromPointer(Vector2 mouse, MaterialRect field) {
         float textWidth = field.Width - 100f;
-        TextEditBuffer.TextWindow window = edit.Window(textWidth, 0.36f, UiFontWeight.Bold);
-        edit.SetCursorFromX(mouse.X - (field.X + 24f), window, 0.36f, UiFontWeight.Bold);
+        TextEditGeometry.TextWindow window = TextEditGeometry.Window(edit, textWidth, 0.36f,
+            UiFontWeight.Bold);
+        edit.SetCursor(TextEditGeometry.IndexFromX(edit, mouse.X - (field.X + 24f), window,
+            0.36f, UiFontWeight.Bold));
     }
 
     private void UpdateNavigation() {
@@ -452,7 +454,8 @@ internal sealed class TextEntryOverlay : Entity {
             * (fieldFocused || error > 0f ? 1f : 0.7f));
 
         float textWidth = field.Width - 100f;
-        TextEditBuffer.TextWindow window = edit.Window(textWidth, 0.36f, UiFontWeight.Bold);
+        TextEditGeometry.TextWindow window = TextEditGeometry.Window(edit, textWidth, 0.36f,
+            UiFontWeight.Bold);
         int caretOffset = Math.Clamp(window.CaretOffset, 0, window.Text.Length);
         string before = window.Text[..caretOffset];
         string after = window.Text[caretOffset..];

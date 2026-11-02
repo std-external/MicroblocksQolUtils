@@ -1,97 +1,131 @@
 using System.Text;
-using Microsoft.Xna.Framework;
 
 namespace Celeste.Mod.MicroblocksQolUtils;
 
 /// <summary>
-/// Editable text with a caret, used by both the inline setting editor and the in-game
-/// keyboard prompt. Spaces are rendered as a visible dot so leading/trailing spaces can be
-/// inspected, and every width is measured through the TTF font (CJK glyphs count double).
+/// Editable single-line text with a caret and a selection anchor. The value is kept verbatim
+/// (spaces stay spaces); width measurement and the visible window live in
+/// <see cref="TextEditGeometry"/> so this type can be exercised without the game assemblies.
 /// </summary>
 internal sealed class TextEditBuffer {
-    private const char SpaceMarker = '·';
-
     public string Text { get; private set; }
     public int Cursor { get; private set; }
+    public int Anchor { get; private set; }
     public int MaxLength { get; }
 
     public TextEditBuffer(string value, int maxLength) {
         Text = value ?? "";
         MaxLength = Math.Max(1, maxLength);
         Cursor = Text.Length;
+        Anchor = Cursor;
     }
 
-    public string Display => Text.Replace(' ', SpaceMarker);
+    public int SelectionStart => Math.Min(Cursor, Anchor);
+    public int SelectionLength => Math.Abs(Cursor - Anchor);
+    public bool HasSelection => Cursor != Anchor;
+    public string SelectedText => Text.Substring(SelectionStart, SelectionLength);
 
-    public bool Insert(char character) {
-        if (Text.Length >= MaxLength) return false;
-        Text = Text.Insert(Cursor, character.ToString());
-        Cursor++;
+    public void SetText(string? value) {
+        string text = value ?? "";
+        Text = text.Length > MaxLength ? text[..MaxLength] : text;
+        Cursor = Text.Length;
+        Anchor = Cursor;
+    }
+
+    public bool Insert(char character) => InsertText(character.ToString());
+
+    /// <summary>
+    /// Inserts <paramref name="value"/> at the caret, replacing the selection. Clipboard input
+    /// can carry line breaks and tabs, so control characters are dropped first: this is a
+    /// single-line field. Returns true when the value actually changed.
+    /// </summary>
+    public bool InsertText(string? value) {
+        value = SingleLine(value);
+        if (value.Length == 0) return false;
+        int room = MaxLength - (Text.Length - SelectionLength);
+        if (room <= 0) return false;
+        if (value.Length > room) value = value[..room];
+        int start = SelectionStart;
+        Text = string.Concat(Text.AsSpan(0, start), value, Text.AsSpan(start + SelectionLength));
+        Cursor = start + value.Length;
+        Anchor = Cursor;
         return true;
     }
 
+    /// <summary>Strips characters that a single-line field cannot show (CR/LF/TAB and friends).</summary>
+    public static string SingleLine(string? value) {
+        if (string.IsNullOrEmpty(value)) return "";
+        StringBuilder builder = new(value.Length);
+        foreach (char character in value) {
+            if (!char.IsControl(character)) builder.Append(character);
+        }
+        return builder.ToString();
+    }
+
     public bool Backspace() {
+        if (HasSelection) return DeleteSelection();
         if (Cursor <= 0) return false;
         Text = Text.Remove(Cursor - 1, 1);
         Cursor--;
+        Anchor = Cursor;
         return true;
     }
 
     public bool Delete() {
+        if (HasSelection) return DeleteSelection();
         if (Cursor >= Text.Length) return false;
         Text = Text.Remove(Cursor, 1);
         return true;
     }
 
-    public void MoveLeft() => Cursor = Math.Max(0, Cursor - 1);
-
-    public void MoveRight() => Cursor = Math.Min(Text.Length, Cursor + 1);
-
-    public void MoveHome() => Cursor = 0;
-
-    public void MoveEnd() => Cursor = Text.Length;
-
-    public void SetCursor(int index) => Cursor = Math.Clamp(index, 0, Text.Length);
-
-    public float CaretWidth(float scale, UiFontWeight weight) =>
-        SystemTtfFont.MeasureVisible(Display[..Cursor], scale, weight).X;
-
-    /// <summary>
-    /// Window of the display text around the caret, plus the index (in <see cref="Display"/>)
-    /// where the window starts and the caret offset inside it. Used to draw fields that are
-    /// narrower than the value without the caret drifting off-screen.
-    /// </summary>
-    public TextWindow Window(float maxWidth, float scale, UiFontWeight weight) {
-        string display = Display;
-        int start = 0;
-        while (start < Cursor
-            && SystemTtfFont.MeasureVisible(display[start..Cursor], scale, weight).X > maxWidth - 10f) {
-            start++;
-        }
-        string shown = start >= display.Length ? "" : display[start..];
-        if (SystemTtfFont.MeasureVisible(shown, scale, weight).X > maxWidth) {
-            shown = MaterialTextUtil.Ellipsize(shown, maxWidth, scale, weight);
-        }
-        return new TextWindow(shown, start, Math.Clamp(Cursor - start, 0, shown.Length));
+    /// <summary>Removes the selected range; the caret ends up where the selection started.</summary>
+    public bool DeleteSelection() {
+        if (!HasSelection) return false;
+        int start = SelectionStart;
+        Text = Text.Remove(start, SelectionLength);
+        Cursor = start;
+        Anchor = start;
+        return true;
     }
 
-    /// <summary>Maps a local x offset inside a <see cref="TextWindow"/> to a caret index.</summary>
-    public void SetCursorFromX(float localX, TextWindow window, float scale, UiFontWeight weight) {
-        string display = Display;
-        int end = window.Start + window.Text.Length;
-        int best = window.Start;
-        float bestDistance = float.MaxValue;
-        for (int index = window.Start; index <= Math.Min(end, display.Length); index++) {
-            float width = SystemTtfFont.MeasureVisible(display[window.Start..index], scale, weight).X;
-            float distance = Math.Abs(width - localX);
-            if (distance >= bestDistance) continue;
-            bestDistance = distance;
-            best = index;
-        }
-        Cursor = Math.Clamp(best, 0, Text.Length);
+    public void SelectAll() {
+        Anchor = 0;
+        Cursor = Text.Length;
     }
 
-    public readonly record struct TextWindow(string Text, int Start, int CaretOffset);
+    public void CollapseSelection() {
+        Cursor = SelectionStart;
+        Anchor = Cursor;
+    }
 
-    public static string Visible(string value) => value.Replace(' ', SpaceMarker);
+    public void MoveLeft(bool extend = false) {
+        if (!extend && HasSelection) {
+            Cursor = SelectionStart;
+            Anchor = Cursor;
+            return;
+        }
+        MoveTo(Cursor - 1, extend);
+    }
+
+    public void MoveRight(bool extend = false) {
+        if (!extend && HasSelection) {
+            Cursor = SelectionStart + SelectionLength;
+            Anchor = Cursor;
+            return;
+        }
+        MoveTo(Cursor + 1, extend);
+    }
+
+    public void MoveHome(bool extend = false) => MoveTo(0, extend);
+
+    public void MoveEnd(bool extend = false) => MoveTo(Text.Length, extend);
+
+    public void SetCursor(int index, bool extend = false) => MoveTo(index, extend);
+
+    private void MoveTo(int index, bool extend) {
+        index = Math.Clamp(index, 0, Text.Length);
+        if (extend && !HasSelection) Anchor = Cursor;
+        Cursor = index;
+        if (!extend) Anchor = index;
+    }
 }
